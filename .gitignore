@@ -1,0 +1,6 @@
+*.tar.gz
+*.rpm
+*.pyc
+__pycache__/
+/build/
+/dist/

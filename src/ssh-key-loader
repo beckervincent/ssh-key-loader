@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")"
+
+GUI=""
+ASKPASS=""
+for d in /usr/libexec/ssh-key-loader /usr/lib/ssh-key-loader \
+         /usr/local/libexec/ssh-key-loader /usr/local/lib/ssh-key-loader; do
+    if [ -e "$d/gui.py" ]; then
+        GUI="$d/gui.py"
+        ASKPASS="$d/askpass"
+        break
+    fi
+done
+if [ -z "$GUI" ]; then
+    HERE="$(cd "$(dirname "$SELF")" && pwd)"
+    GUI="$HERE/ssh_key_loader_gui.py"
+    ASKPASS="$HERE/ssh-key-loader-askpass"
+fi
+
+read_config() {
+    python3 - "$@" <<'PY'
+import configparser, os
+from pathlib import Path
+cfg = configparser.ConfigParser()
+cfg["key"] = {"path": "", "paths": "", "add_root": "true"}
+sysf = Path("/etc/ssh-key-loader/config.ini")
+userf = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ssh-key-loader" / "config.ini"
+for f in (sysf, userf):
+    if f.is_file():
+        cfg.read(f)
+keys = []
+raw = cfg["key"].get("paths", "").strip()
+if raw:
+    keys = [line.strip() for line in raw.splitlines() if line.strip()]
+single = cfg["key"].get("path", "").strip()
+if single and single not in keys:
+    keys.insert(0, single)
+print("true" if cfg["key"].getboolean("add_root", fallback=True) else "false")
+for k in keys:
+    print(k)
+PY
+}
+
+wire_env() {  # $1 = home dir, $2 = socket; export SSH_AUTH_SOCK for any shell
+    local home="$1" sock="$2"
+    local envdir="$home/.config/ssh-key-loader"
+    local envfile="$envdir/env"
+    mkdir -p "$envdir"
+    printf 'export SSH_AUTH_SOCK=%s\n' "$sock" > "$envfile"
+
+    local src=". \"$envfile\""
+    for rc in "$home/.bashrc" "$home/.profile"; do
+        [ -e "$rc" ] || [ "$rc" = "$home/.bashrc" ] || continue
+        grep -qF "$envfile" "$rc" 2>/dev/null || printf '%s\n' "$src" >> "$rc"
+    done
+    if [ -e "$home/.zshrc" ] || command -v zsh >/dev/null 2>&1; then
+        grep -qF "$envfile" "$home/.zshrc" 2>/dev/null || printf '%s\n' "$src" >> "$home/.zshrc"
+    fi
+    if [ -d "$home/.config/fish" ] || command -v fish >/dev/null 2>&1; then
+        mkdir -p "$home/.config/fish/conf.d"
+        printf 'set -gx SSH_AUTH_SOCK %s\n' "$sock" > "$home/.config/fish/conf.d/ssh-key-loader.fish"
+    fi
+}
+
+load() {  # $1 = home dir, $2 = key path, $3 = passphrase
+    local sock="$1/.ssh/agent.sock"
+    mkdir -p "$1/.ssh"
+    export SSH_AUTH_SOCK="$sock"
+    ssh-add -l >/dev/null 2>&1 || { rm -f "$sock"; ssh-agent -a "$sock" >/dev/null; }
+    SKL_PASSPHRASE="$3" ssh-add "$2" </dev/null
+    wire_env "$1" "$sock"
+}
+
+elevate() {  # run "$@" as root via whatever escalation exists
+    if command -v pkexec >/dev/null 2>&1; then
+        pkexec "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        echo "ssh-key-loader: no pkexec or sudo; cannot load root agent" >&2
+        return 1
+    fi
+}
+
+if [ "${1:-}" = "--settings" ]; then
+    exec python3 "$GUI" --settings
+fi
+
+export SSH_ASKPASS="$ASKPASS"
+export SSH_ASKPASS_REQUIRE=force
+
+if [ "${SKL_ROOT:-}" = 1 ]; then
+    n="${SKL_NKEYS:-0}"
+    i=0
+    while [ "$i" -lt "$n" ]; do
+        kvar="SKL_KEY_$i"
+        pvar="SKL_PASS_$i"
+        load /root "${!kvar}" "${!pvar}"
+        i=$((i + 1))
+    done
+    exit 0
+fi
+
+ADD_ROOT=""
+ALL_KEYS=()
+while IFS= read -r line; do
+    if [ -z "$ADD_ROOT" ]; then
+        ADD_ROOT="$line"
+    else
+        ALL_KEYS+=("$line")
+    fi
+done < <(read_config)
+
+KEYS=()
+if [ "${#ALL_KEYS[@]}" -gt 0 ]; then
+    for k in "${ALL_KEYS[@]}"; do
+        [ -f "$k" ] && KEYS+=("$k")
+    done
+fi
+
+if [ "${#KEYS[@]}" -eq 0 ]; then
+    if [ -t 1 ]; then
+        echo "ssh-key-loader: no key configured. Run: ssh-key-loader --settings" >&2
+    fi
+    exit 0
+fi
+
+PASS=()
+for k in "${KEYS[@]}"; do
+    p="$(python3 "$GUI" --key-label "$(basename "$k")")" || exit 0
+    PASS+=("$p")
+    load "$HOME" "$k" "$p"
+done
+
+if [ "$ADD_ROOT" = "true" ]; then
+    ENVARGS=(SKL_ROOT=1 "SKL_NKEYS=${#KEYS[@]}" \
+        "SSH_ASKPASS=$ASKPASS" SSH_ASKPASS_REQUIRE=force)
+    i=0
+    while [ "$i" -lt "${#KEYS[@]}" ]; do
+        ENVARGS+=("SKL_KEY_$i=${KEYS[$i]}" "SKL_PASS_$i=${PASS[$i]}")
+        i=$((i + 1))
+    done
+    elevate env "${ENVARGS[@]}" bash "$SELF" || true
+fi

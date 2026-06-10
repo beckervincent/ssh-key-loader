@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SSH Key Loader
+Comment=Load an SSH key into the agent for your user and root
+Exec=ssh-key-loader
+Icon=dialog-password
+Terminal=false
+Categories=Utility;Security;
+Keywords=ssh;key;agent;passphrase;

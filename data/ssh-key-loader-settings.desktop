@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=SSH Key Loader Settings
+Comment=Configure which SSH key to load and startup behavior
+Exec=ssh-key-loader --settings
+Icon=preferences-system
+Terminal=false
+Categories=Settings;Security;
+Keywords=ssh;key;agent;settings;
