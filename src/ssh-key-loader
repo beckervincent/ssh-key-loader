@@ -3,20 +3,21 @@ set -euo pipefail
 
 SELF="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$0")"
 
+HERE="$(cd "$(dirname "$SELF")" && pwd)"
 GUI=""
 ASKPASS=""
-for d in /usr/libexec/ssh-key-loader /usr/lib/ssh-key-loader \
-         /usr/local/libexec/ssh-key-loader /usr/local/lib/ssh-key-loader; do
-    if [ -e "$d/gui.py" ]; then
-        GUI="$d/gui.py"
-        ASKPASS="$d/askpass"
-        break
-    fi
-done
-if [ -z "$GUI" ]; then
-    HERE="$(cd "$(dirname "$SELF")" && pwd)"
+if [ -e "$HERE/ssh_key_loader_gui.py" ] && [ -e "$HERE/ssh-key-loader-askpass" ]; then
     GUI="$HERE/ssh_key_loader_gui.py"
     ASKPASS="$HERE/ssh-key-loader-askpass"
+else
+    for d in /usr/libexec/ssh-key-loader /usr/lib/ssh-key-loader \
+             /usr/local/libexec/ssh-key-loader /usr/local/lib/ssh-key-loader; do
+        if [ -e "$d/gui.py" ]; then
+            GUI="$d/gui.py"
+            ASKPASS="$d/askpass"
+            break
+        fi
+    done
 fi
 
 read_config() {
@@ -64,13 +65,35 @@ wire_env() {  # $1 = home dir, $2 = socket; export SSH_AUTH_SOCK for any shell
     fi
 }
 
+show_error() {
+    local msg="$1"
+    echo "ssh-key-loader: $msg" >&2
+    if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
+        python3 "$GUI" --error "$msg" >/dev/null 2>&1 || true
+    fi
+}
+
 load() {  # $1 = home dir, $2 = key path, $3 = passphrase
-    local sock="$1/.ssh/agent.sock"
-    mkdir -p "$1/.ssh"
+    local home="$1" key="$2" pass="$3"
+    local sock="$home/.ssh/agent.sock"
+    mkdir -p "$home/.ssh"
     export SSH_AUTH_SOCK="$sock"
-    ssh-add -l >/dev/null 2>&1 || { rm -f "$sock"; ssh-agent -a "$sock" >/dev/null; }
-    SKL_PASSPHRASE="$3" ssh-add "$2" </dev/null
-    wire_env "$1" "$sock"
+    local code=0
+    ssh-add -l >/dev/null 2>&1 || code=$?
+    if [ "$code" -eq 2 ]; then
+        rm -f "$sock"
+        if ! ssh-agent -a "$sock" >/dev/null 2>&1; then
+            echo "ssh-key-loader: failed to start ssh-agent at $sock" >&2
+            return 1
+        fi
+    fi
+    local err
+    if ! err=$(SKL_PASSPHRASE="$pass" ssh-add "$key" </dev/null 2>&1); then
+        echo "ssh-key-loader: failed to load key $key: $err" >&2
+        return 1
+    fi
+    wire_env "$home" "$sock"
+    return 0
 }
 
 elevate() {  # run "$@" as root via whatever escalation exists
@@ -97,7 +120,9 @@ if [ "${SKL_ROOT:-}" = 1 ]; then
     while [ "$i" -lt "$n" ]; do
         kvar="SKL_KEY_$i"
         pvar="SKL_PASS_$i"
-        load /root "${!kvar}" "${!pvar}"
+        if [ -n "${!kvar:-}" ]; then
+            load /root "${!kvar}" "${!pvar:-}" || true
+        fi
         i=$((i + 1))
     done
     exit 0
@@ -116,7 +141,11 @@ done < <(read_config)
 KEYS=()
 if [ "${#ALL_KEYS[@]}" -gt 0 ]; then
     for k in "${ALL_KEYS[@]}"; do
-        [ -f "$k" ] && KEYS+=("$k")
+        if [ -f "$k" ]; then
+            KEYS+=("$k")
+        else
+            echo "ssh-key-loader: key file not found: $k" >&2
+        fi
     done
 fi
 
@@ -127,20 +156,37 @@ if [ "${#KEYS[@]}" -eq 0 ]; then
     exit 0
 fi
 
-PASS=()
+LOADED_KEYS=()
+LOADED_PASS=()
 for k in "${KEYS[@]}"; do
-    p="$(python3 "$GUI" --key-label "$(basename "$k")")" || exit 0
-    PASS+=("$p")
-    load "$HOME" "$k" "$p"
+    p=""
+    if ! ssh-keygen -y -P "" -f "$k" >/dev/null 2>&1; then
+        if ! p="$(python3 "$GUI" --key-label "$(basename "$k")" --key-path "$k")"; then
+            echo "ssh-key-loader: skipping $(basename "$k") (unlock cancelled)" >&2
+            continue
+        fi
+    fi
+
+    if load "$HOME" "$k" "$p"; then
+        LOADED_KEYS+=("$k")
+        LOADED_PASS+=("$p")
+    else
+        show_error "Failed to add $(basename "$k") to SSH agent."
+    fi
 done
 
-if [ "$ADD_ROOT" = "true" ]; then
-    ENVARGS=(SKL_ROOT=1 "SKL_NKEYS=${#KEYS[@]}" \
+if [ "$ADD_ROOT" = "true" ] && [ "${#LOADED_KEYS[@]}" -gt 0 ]; then
+    ENVARGS=(SKL_ROOT=1 "SKL_NKEYS=${#LOADED_KEYS[@]}" \
         "SSH_ASKPASS=$ASKPASS" SSH_ASKPASS_REQUIRE=force)
     i=0
-    while [ "$i" -lt "${#KEYS[@]}" ]; do
-        ENVARGS+=("SKL_KEY_$i=${KEYS[$i]}" "SKL_PASS_$i=${PASS[$i]}")
+    while [ "$i" -lt "${#LOADED_KEYS[@]}" ]; do
+        ENVARGS+=("SKL_KEY_$i=${LOADED_KEYS[$i]}" "SKL_PASS_$i=${LOADED_PASS[$i]}")
         i=$((i + 1))
     done
-    elevate env "${ENVARGS[@]}" bash "$SELF" || true
+
+    trap 'echo "ssh-key-loader: root authentication cancelled; keys loaded for user only." >&2; exit 0' INT
+    if ! elevate env "${ENVARGS[@]}" bash "$SELF" 2>/dev/null; then
+        echo "ssh-key-loader: root authentication cancelled or failed; keys loaded for user only." >&2
+    fi
+    trap - INT
 fi

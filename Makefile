@@ -30,4 +30,4 @@ uninstall:
 
 lint:
 	bash -n src/ssh-key-loader src/ssh-key-loader-askpass
-	python3 -m py_compile src/ssh_key_loader_gui.py
+	PYTHONPYCACHEPREFIX=$${TMPDIR:-/tmp}/pycache python3 -m py_compile src/ssh_key_loader_gui.py

@@ -2,6 +2,7 @@
 import argparse
 import configparser
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -89,6 +90,8 @@ def dress_up_window(theme: str) -> None:
         schemes.get(theme, Adw.ColorScheme.FORCE_DARK)
     )
     display = Gdk.Display.get_default()
+    if display is None:
+        return
     if _oled_provider is not None:
         Gtk.StyleContext.remove_provider_for_display(display, _oled_provider)
         _oled_provider = None
@@ -127,10 +130,43 @@ def set_autostart(enabled: bool) -> None:
         AUTOSTART_FILE.unlink()
 
 
+def validate_key_passphrase(key_path: str, passphrase: str) -> tuple[bool, str]:
+    if not os.path.exists(key_path):
+        return False, f"Key file not found: {key_path}"
+    try:
+        proc = subprocess.run(
+            ["ssh-keygen", "-y", "-P", passphrase, "-f", key_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception as e:
+        return False, f"Error validating passphrase: {e}"
+
+    if proc.returncode == 0:
+        return True, ""
+
+    stderr = proc.stderr.strip()
+    stderr_lower = stderr.lower()
+    if "incorrect passphrase" in stderr_lower:
+        return False, "Incorrect passphrase. Please try again."
+    elif "bad permissions" in stderr_lower:
+        return False, "Private key has insecure permissions (must be 0600)."
+    elif "invalid format" in stderr_lower:
+        return False, "Invalid private key format."
+    elif "no such file" in stderr_lower:
+        return False, f"Key file not found: {key_path}"
+    else:
+        lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+        msg = lines[-1] if lines else "Failed to unlock key."
+        return False, msg
+
+
 class PassphraseApp(Adw.Application):
-    def __init__(self, key_label: str):
+    def __init__(self, key_label: str, key_path: str = ""):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.key_label = key_label
+        self.key_path = key_path
         self.result = None
 
     def do_activate(self):
@@ -146,6 +182,16 @@ class PassphraseApp(Adw.Application):
         rowpile = Gtk.ListBox(css_classes=["boxed-list"])
         rowpile.append(entry)
         box.append(rowpile)
+
+        error_label = Gtk.Label(
+            label="",
+            wrap=True,
+            xalign=0,
+            css_classes=["error"],
+            visible=False,
+        )
+        box.append(error_label)
+
         buttonzoo = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
                             halign=Gtk.Align.END)
         cancel = Gtk.Button(label="Cancel")
@@ -155,13 +201,65 @@ class PassphraseApp(Adw.Application):
         box.append(buttonzoo)
         win.set_content(box)
 
+        def on_changed(*_):
+            if entry.has_css_class("error"):
+                entry.remove_css_class("error")
+                error_label.set_visible(False)
+
         def accept(*_):
-            self.result = entry.get_text()
+            passphrase = entry.get_text()
+            if self.key_path:
+                ok_pass, err_msg = validate_key_passphrase(self.key_path, passphrase)
+                if not ok_pass:
+                    error_label.set_label(err_msg)
+                    error_label.set_visible(True)
+                    entry.add_css_class("error")
+                    entry.error_bell()
+                    entry.select_region(0, -1)
+                    return
+            self.result = passphrase
             win.close()
 
         cancel.connect("clicked", lambda *_: win.close())
         ok.connect("clicked", accept)
         entry.connect("entry-activated", accept)
+        entry.connect("notify::text", on_changed)
+        win.present()
+
+
+class ErrorApp(Adw.Application):
+    def __init__(self, message: str):
+        super().__init__(application_id=APP_ID + ".Error", flags=Gio.ApplicationFlags.NON_UNIQUE)
+        self.message = message
+
+    def do_activate(self):
+        cfg = load_config()
+        dress_up_window(cfg["ui"].get("theme", "oled"))
+        win = Adw.Window(application=self, title="SSH Key Loader",
+                         default_width=400, modal=True, resizable=False)
+        win.set_opacity(window_opacity(cfg))
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16,
+                      margin_top=20, margin_bottom=20, margin_start=20, margin_end=20)
+
+        heading_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        icon = Gtk.Image.new_from_icon_name("dialog-error-symbolic")
+        icon.set_icon_size(Gtk.IconSize.LARGE)
+        heading_box.append(icon)
+
+        lbl_title = Gtk.Label(label="Error loading SSH key", css_classes=["title-3"], xalign=0)
+        heading_box.append(lbl_title)
+        box.append(heading_box)
+
+        msg_label = Gtk.Label(label=self.message, wrap=True, xalign=0)
+        box.append(msg_label)
+
+        btn_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, halign=Gtk.Align.END)
+        ok_btn = Gtk.Button(label="OK", css_classes=["suggested-action"])
+        ok_btn.connect("clicked", lambda *_: win.close())
+        btn_box.append(ok_btn)
+        box.append(btn_box)
+
+        win.set_content(box)
         win.present()
 
 
@@ -278,14 +376,44 @@ class SettingsApp(Adw.Application):
 def main():
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--settings", action="store_true", help="open settings window")
+    parser.add_argument("--error", help="show error dialog with message")
     parser.add_argument("--key-label", default="your SSH key")
+    parser.add_argument("--key-path", default="", help="path to private key file")
     args = parser.parse_args()
 
     if args.settings:
         SettingsApp().run([])
         return 0
 
-    app = PassphraseApp(args.key_label)
+    if args.error:
+        if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+            sys.stderr.write(f"ssh-key-loader: {args.error}\n")
+            return 0
+        ErrorApp(args.error).run([])
+        return 0
+
+    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DISPLAY")):
+        import getpass
+        while True:
+            try:
+                if sys.stdin.isatty():
+                    p = getpass.getpass(f"Passphrase for {args.key_label}: ")
+                else:
+                    line = sys.stdin.readline()
+                    if not line:
+                        return 1
+                    p = line.rstrip("\r\n")
+            except (KeyboardInterrupt, EOFError):
+                return 1
+            if args.key_path:
+                ok, err = validate_key_passphrase(args.key_path, p)
+                if not ok:
+                    sys.stderr.write(f"{err}\n")
+                    continue
+            sys.stdout.write(p + "\n")
+            return 0
+
+    app = PassphraseApp(args.key_label, args.key_path)
     app.run([])
     if app.result is None:
         return 1
